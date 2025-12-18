@@ -1,0 +1,300 @@
+{% extends "base.html" %}
+
+{% block title %}{{ album.payload.get('name', 'Album') }} - Lightroom Gallery{% endblock %}
+
+{% block content %}
+<div class="gallery-container">
+    <div class="gallery-header">
+        <a href="{{ url_for('albums') }}" class="back-link">← Back to Albums</a>
+        <h2>{{ album.payload.get('name', 'Untitled Album') }}</h2>
+        {% if album.payload.get('assetCount') %}
+        <p class="photo-count">{{ album.payload.assetCount }} photos</p>
+        {% endif %}
+    </div>
+
+    {% if photos %}
+        <div class="photo-grid" id="photo-grid">
+            {% for photo in photos %}
+            <div class="photo-item">
+                {% set asset_id = photo.get('asset', {}).get('id') %}
+                {% if asset_id %}
+                    <a href="#"
+                       class="photo-link"
+                       data-asset-id="{{ asset_id }}"
+                       data-filename="{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}"
+                       onclick="openLightbox('{{ asset_id }}', '{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}'); return false;">
+                        <img src="{{ url_for('thumbnail', asset_id=asset_id) }}"
+                             alt="{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}"
+                             class="photo-thumbnail"
+                             loading="lazy">
+                        <div class="photo-info">
+                            {% if photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName') %}
+                            <p class="photo-filename">{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}</p>
+                            {% endif %}
+                        </div>
+                    </a>
+                {% else %}
+                    <div class="photo-placeholder">
+                        {% if photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName') %}
+                        <p>{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}</p>
+                        {% else %}
+                        <p>Photo</p>
+                        {% endif %}
+                        <small>ID: {{ photo.get('asset', {}).get('id', 'Unknown') }}</small>
+                    </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="loading-indicator" id="loading-indicator" style="display: none;">
+            <div class="loading-spinner"></div>
+            <p>Loading more photos...</p>
+        </div>
+    {% else %}
+        <div class="empty-state">
+            <p>This album is empty.</p>
+        </div>
+    {% endif %}
+</div>
+
+<!-- Lightbox -->
+<div id="lightbox" class="lightbox" onclick="closeLightboxOnBackground(event)">
+    <button class="lightbox-close" onclick="closeLightbox()">&times;</button>
+    <div class="lightbox-content">
+        <div class="lightbox-loading" id="lightbox-loading">Loading Image...</div>
+        <img id="lightbox-image" class="lightbox-image" alt="">
+        <div class="lightbox-caption" id="lightbox-caption"></div>
+    </div>
+</div>
+
+<script>
+// Build array of photos for navigation
+let photos = [
+    {% for photo in photos %}
+    {% set asset_id = photo.get('asset', {}).get('id') %}
+    {% if asset_id %}
+    {
+        assetId: '{{ asset_id }}',
+        filename: '{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}'
+    }{% if not loop.last %},{% endif %}
+    {% endif %}
+    {% endfor %}
+];
+
+let currentPhotoIndex = -1;
+
+// Infinite scroll state
+let nextPageUrl = {{ next_url|tojson if next_url else 'null' }};
+let isLoading = false;
+const albumId = '{{ album_id }}';
+
+function createPhotoElement(assetId, filename) {
+    const photoItem = document.createElement('div');
+    photoItem.className = 'photo-item';
+
+    const photoLink = document.createElement('a');
+    photoLink.href = '#';
+    photoLink.className = 'photo-link';
+    photoLink.dataset.assetId = assetId;
+    photoLink.dataset.filename = filename;
+    photoLink.onclick = function() {
+        openLightbox(assetId, filename);
+        return false;
+    };
+
+    const img = document.createElement('img');
+    img.src = "{{ url_for('thumbnail', asset_id='ASSET_ID') }}".replace('ASSET_ID', assetId);
+    img.alt = filename;
+    img.className = 'photo-thumbnail';
+    img.loading = 'lazy';
+
+    const photoInfo = document.createElement('div');
+    photoInfo.className = 'photo-info';
+
+    const filenameP = document.createElement('p');
+    filenameP.className = 'photo-filename';
+    filenameP.textContent = filename;
+
+    photoInfo.appendChild(filenameP);
+    photoLink.appendChild(img);
+    photoLink.appendChild(photoInfo);
+    photoItem.appendChild(photoLink);
+
+    return photoItem;
+}
+
+async function loadMorePhotos() {
+    if (!nextPageUrl || isLoading) return;
+
+    isLoading = true;
+    const loadingIndicator = document.getElementById('loading-indicator');
+    loadingIndicator.style.display = 'block';
+
+    try {
+        const response = await fetch(`/api/album/${albumId}/photos?page_url=${encodeURIComponent(nextPageUrl)}`);
+        const data = await response.json();
+
+        if (data.error) {
+            console.error('Error loading photos:', data.error);
+            return;
+        }
+
+        const photoGrid = document.getElementById('photo-grid');
+
+        // Add new photos to the grid
+        data.photos.forEach(photo => {
+            const photoElement = createPhotoElement(photo.asset_id, photo.filename);
+            photoGrid.appendChild(photoElement);
+
+            // Add to photos array for lightbox navigation
+            photos.push({
+                assetId: photo.asset_id,
+                filename: photo.filename
+            });
+        });
+
+        // Update next page URL
+        nextPageUrl = data.next_url;
+
+    } catch (error) {
+        console.error('Error loading photos:', error);
+    } finally {
+        isLoading = false;
+        loadingIndicator.style.display = 'none';
+    }
+}
+
+// Scroll event handler
+function handleScroll() {
+    const scrollPosition = window.innerHeight + window.scrollY;
+    const threshold = document.documentElement.scrollHeight - 500; // Trigger 500px before bottom
+
+    if (scrollPosition >= threshold && !isLoading && nextPageUrl) {
+        loadMorePhotos();
+    }
+}
+
+// Attach scroll listener
+window.addEventListener('scroll', handleScroll);
+
+// Initial check in case content is shorter than viewport
+setTimeout(() => {
+    if (document.documentElement.scrollHeight <= window.innerHeight && nextPageUrl) {
+        loadMorePhotos();
+    }
+}, 100);
+
+function openLightbox(assetId, filename) {
+    // Find the index of the current photo
+    currentPhotoIndex = photos.findIndex(p => p.assetId === assetId);
+
+    loadImage(assetId, filename);
+
+    const lightbox = document.getElementById('lightbox');
+    lightbox.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+}
+
+function loadImage(assetId, filename) {
+    const image = document.getElementById('lightbox-image');
+    const caption = document.getElementById('lightbox-caption');
+    const loading = document.getElementById('lightbox-loading');
+
+    // Show loading
+    loading.style.display = 'block';
+    loading.textContent = 'Loading Image...';
+    loading.classList.remove('lightbox-error');
+    image.style.display = 'none';
+
+    // Build full-size image URL
+    const imageUrl = "{{ url_for('thumbnail', asset_id='ASSET_ID') }}".replace('ASSET_ID', assetId) + '?type=2048';
+
+    // Load the image
+    image.src = imageUrl;
+    caption.textContent = filename;
+
+    image.onload = function() {
+        loading.style.display = 'none';
+        image.style.display = 'block';
+    };
+
+    image.onerror = function() {
+        loading.textContent = 'Error loading image';
+        loading.classList.add('lightbox-error');
+        loading.style.display = 'block';
+        image.style.display = 'none';
+    };
+}
+
+async function showNextImage() {
+    if (photos.length === 0) return;
+
+    // If at the last image, try to load more photos
+    if (currentPhotoIndex >= photos.length - 1) {
+        if (nextPageUrl && !isLoading) {
+            // Load more photos before advancing
+            await loadMorePhotos();
+        }
+
+        // Check if we successfully loaded more photos
+        if (currentPhotoIndex >= photos.length - 1) {
+            // Still at the end, no more photos available
+            return;
+        }
+    }
+
+    // Move to next image
+    currentPhotoIndex++;
+    const photo = photos[currentPhotoIndex];
+    loadImage(photo.assetId, photo.filename);
+}
+
+function showPreviousImage() {
+    if (photos.length === 0) return;
+
+    // Don't do anything if at the first image
+    if (currentPhotoIndex <= 0) {
+        return;
+    }
+
+    // Move to previous image
+    currentPhotoIndex--;
+    const photo = photos[currentPhotoIndex];
+    loadImage(photo.assetId, photo.filename);
+}
+
+function closeLightbox() {
+    const lightbox = document.getElementById('lightbox');
+    const image = document.getElementById('lightbox-image');
+
+    lightbox.style.display = 'none';
+    document.body.style.overflow = 'auto';
+    image.src = '';
+    currentPhotoIndex = -1;
+}
+
+function closeLightboxOnBackground(event) {
+    if (event.target.id === 'lightbox') {
+        closeLightbox();
+    }
+}
+
+// Handle keyboard navigation
+document.addEventListener('keydown', function(event) {
+    const lightbox = document.getElementById('lightbox');
+    const isLightboxOpen = lightbox.style.display === 'flex';
+
+    if (!isLightboxOpen) return;
+
+    if (event.key === 'Escape') {
+        closeLightbox();
+    } else if (event.key === 'ArrowRight') {
+        showNextImage();
+    } else if (event.key === 'ArrowLeft') {
+        showPreviousImage();
+    }
+});
+</script>
+{% endblock %}
+

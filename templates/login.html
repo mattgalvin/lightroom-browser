@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+
+{% block title %}Login - Lightroom Gallery{% endblock %}
+
+{% block content %}
+<div class="login-container">
+    <div class="login-card">
+        <h2>Welcome to Lightroom Gallery</h2>
+        <p>Connect your Adobe Lightroom account to view your photos and albums</p>
+        <a href="{{ url_for('oauth_start') }}" class="login-button">Sign in with Adobe</a>
+        <p class="login-info">You'll be redirected to Adobe to authorize access to your Lightroom photos</p>
+    </div>
+</div>
+{% endblock %}
+

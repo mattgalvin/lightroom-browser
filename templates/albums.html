@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+
+{% block title %}Albums - Lightroom Gallery{% endblock %}
+
+{% block content %}
+<div class="albums-container">
+    <h2>Your Albums</h2>
+
+    {% if albums %}
+        <div class="albums-grid" id="albums-grid">
+            {% for album in albums %}
+            <div class="album-card">
+                <a href="{{ url_for('album_view', album_id=album.id) }}">
+                    {% if album.get('first_asset_id') %}
+                    <div class="album-thumbnail">
+                        <img src="{{ url_for('thumbnail', asset_id=album.first_asset_id) }}"
+                             alt="{{ album.get('payload', album).get('name', 'Album') }}"
+                             loading="lazy">
+                    </div>
+                    {% else %}
+                    <div class="album-thumbnail album-placeholder">
+                        <span>No Photos</span>
+                    </div>
+                    {% endif %}
+                    <div class="album-info">
+                        {% set payload = album.get('payload', album) %}
+                        <h3>{{ payload.get('name', 'Untitled Album') }}</h3>
+                        <p class="album-meta">
+                            {% if payload.get('assetCount') %}
+                            {{ payload.assetCount }} photos
+                            {% endif %}
+                        </p>
+                    </div>
+                </a>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="loading-indicator" id="albums-loading-indicator" style="display: none;">
+            <div class="loading-spinner"></div>
+            <p>Loading more albums...</p>
+        </div>
+    {% else %}
+        <div class="empty-state">
+            <p>No albums found. Create an album in Lightroom to get started.</p>
+        </div>
+    {% endif %}
+</div>
+
+<script>
+// Infinite scroll state for albums
+let nextNameAfter = {{ next_name_after|tojson if next_name_after else 'null' }};
+let isLoadingAlbums = false;
+
+function createAlbumElement(album) {
+    const albumCard = document.createElement('div');
+    albumCard.className = 'album-card';
+
+    const albumLink = document.createElement('a');
+    albumLink.href = `/album/${album.id}`;
+
+    // Create thumbnail
+    const albumThumbnail = document.createElement('div');
+    albumThumbnail.className = 'album-thumbnail';
+
+    if (album.first_asset_id) {
+        const img = document.createElement('img');
+        img.src = `/thumbnail/${album.first_asset_id}`;
+        img.alt = album.name;
+        img.loading = 'lazy';
+        albumThumbnail.appendChild(img);
+    } else {
+        albumThumbnail.className = 'album-thumbnail album-placeholder';
+        const span = document.createElement('span');
+        span.textContent = 'No Photos';
+        albumThumbnail.appendChild(span);
+    }
+
+    // Create album info
+    const albumInfo = document.createElement('div');
+    albumInfo.className = 'album-info';
+
+    const albumName = document.createElement('h3');
+    albumName.textContent = album.name;
+
+    const albumMeta = document.createElement('p');
+    albumMeta.className = 'album-meta';
+    if (album.asset_count) {
+        albumMeta.textContent = `${album.asset_count} photos`;
+    }
+
+    albumInfo.appendChild(albumName);
+    albumInfo.appendChild(albumMeta);
+
+    albumLink.appendChild(albumThumbnail);
+    albumLink.appendChild(albumInfo);
+    albumCard.appendChild(albumLink);
+
+    return albumCard;
+}
+
+async function loadMoreAlbums() {
+    if (!nextNameAfter || isLoadingAlbums) return;
+
+    isLoadingAlbums = true;
+    const loadingIndicator = document.getElementById('albums-loading-indicator');
+    loadingIndicator.style.display = 'block';
+
+    try {
+        const response = await fetch(`/api/albums?name_after=${encodeURIComponent(nextNameAfter)}`);
+        const data = await response.json();
+
+        if (data.error) {
+            console.error('Error loading albums:', data.error);
+            return;
+        }
+
+        const albumsGrid = document.getElementById('albums-grid');
+
+        // Add new albums to the grid
+        data.albums.forEach(album => {
+            const albumElement = createAlbumElement(album);
+            albumsGrid.appendChild(albumElement);
+        });
+
+        // Update next name_after
+        nextNameAfter = data.next_name_after;
+
+    } catch (error) {
+        console.error('Error loading albums:', error);
+    } finally {
+        isLoadingAlbums = false;
+        loadingIndicator.style.display = 'none';
+    }
+}
+
+// Scroll event handler
+function handleAlbumsScroll() {
+    const scrollPosition = window.innerHeight + window.scrollY;
+    const threshold = document.documentElement.scrollHeight - 500;
+
+    if (scrollPosition >= threshold && !isLoadingAlbums && nextNameAfter) {
+        loadMoreAlbums();
+    }
+}
+
+// Attach scroll listener
+window.addEventListener('scroll', handleAlbumsScroll);
+
+// Initial check in case content is shorter than viewport
+setTimeout(() => {
+    if (document.documentElement.scrollHeight <= window.innerHeight && nextNameAfter) {
+        loadMoreAlbums();
+    }
+}, 100);
+</script>
+{% endblock %}
+
