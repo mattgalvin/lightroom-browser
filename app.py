@@ -208,7 +208,7 @@ def album_photos_api(album_id):
 
     try:
         access_token = session['access_token']
-        photos, next_url, prev_url = lightroom_client.get_album_assets_page(
+        photos, next_url, _ = lightroom_client.get_album_assets_page(
             access_token, album_id, limit=PHOTOS_PER_PAGE, page_url=page_url
         )
 
