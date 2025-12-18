@@ -177,6 +177,8 @@ class LightroomClient:
                 - next_name_after: Value for name_after to get next page, or None if no more pages
         """
         catalog = self.get_catalog(access_token)
+        if not catalog:
+            raise Exception("Could not retrieve catalog")
         catalog_id = catalog.get('id')
         if not catalog_id:
             raise Exception("Could not retrieve catalog ID")
@@ -219,8 +221,9 @@ class LightroomClient:
             dict: Album information
         """
         catalog = self.get_catalog(access_token)
+        if not catalog:
+            raise Exception("Could not retrieve catalog")
         catalog_id = catalog.get('id')
-        
         if not catalog_id:
             raise Exception("Could not retrieve catalog ID")
         
@@ -232,6 +235,8 @@ class LightroomClient:
         Get a single page of assets for an album with limit and pagination links.
         """
         catalog = self.get_catalog(access_token)
+        if not catalog:
+            raise Exception("Could not retrieve catalog")
         catalog_id = catalog.get('id')
         if not catalog_id:
             raise Exception("Could not retrieve catalog ID")
@@ -290,8 +295,9 @@ class LightroomClient:
         """
         try:
             catalog = self.get_catalog(access_token)
+            if not catalog:
+                raise Exception("Could not retrieve catalog")
             catalog_id = catalog.get('id')
-
             if not catalog_id:
                 raise Exception("Could not retrieve catalog ID")
 
@@ -322,8 +328,9 @@ class LightroomClient:
             bytes: Image binary data
         """
         catalog = self.get_catalog(access_token)
+        if not catalog:
+            raise Exception("Could not retrieve catalog")
         catalog_id = catalog.get('id')
-
         if not catalog_id:
             raise Exception("Could not retrieve catalog ID")
 
