@@ -40,6 +40,12 @@ instance/
 *.swo
 *~
 
+# Add specific vscode files
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
 # OS
 .DS_Store
 Thumbs.db
