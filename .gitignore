@@ -34,7 +34,7 @@ instance/
 *.log
 
 # IDE
-.vscode/
+.vscode/*
 .idea/
 *.swp
 *.swo
