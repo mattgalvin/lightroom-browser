@@ -94,7 +94,7 @@ class LightroomClient:
         if kwargs:
             logger.debug(f"Request kwargs: {kwargs}")
 
-        response = requests.request(method, url, headers=headers, **kwargs)
+        response = requests.request(method, url, headers=headers, verify=False, **kwargs)
 
         # Log response details
         logger.info(f"Lightroom API Response: {response.status_code} from {method} {url}")
@@ -344,7 +344,7 @@ class LightroomClient:
         logger.info(f"Lightroom API Request: GET {url}")
         logger.debug(f"Request headers: {safe_headers}")
 
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, verify=False)
 
         # Log response
         logger.info(f"Lightroom API Response: {response.status_code} from GET {url}")
