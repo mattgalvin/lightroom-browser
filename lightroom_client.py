@@ -5,55 +5,81 @@ Handles API calls to Adobe Lightroom API
 
 import re
 import json
+import hashlib
 import logging
+import threading
+from collections import OrderedDict
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import requests
-from oauth_handler import OAuthHandler
 
 # Set up logger
 logger = logging.getLogger(__name__)
 
+
+class TokenExpiredError(Exception):
+    """Raised when the Lightroom API rejects the access token (HTTP 401)."""
+
+
+class InvalidInputError(Exception):
+    """Raised when a caller-supplied ID or URL is not acceptable."""
+
+
+_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _check_id(value, what='id'):
+    """Make sure an ID is safe to place in an API URL path."""
+    if not isinstance(value, str) or not _ID_RE.match(value):
+        raise InvalidInputError(f"Invalid {what}")
+    return value
+
+
 class LightroomClient:
     """Client for interacting with Adobe Lightroom API"""
-    
-    catalog = None
-    
+
     # Lightroom API base URL
     API_BASE_URL = "https://lr.adobe.io/v2"
-    
+    API_HOST = urlparse(API_BASE_URL).netloc
+
+    REQUEST_TIMEOUT = 30
+    CATALOG_CACHE_SIZE = 256
+
     def __init__(self, oauth_handler):
         """
         Initialize Lightroom client
-        
+
         Args:
             oauth_handler: OAuthHandler instance for authentication
         """
         self.oauth_handler = oauth_handler
-    
+        # Catalogs are per user, so cache them per access token (LRU-bounded)
+        self._catalog_cache = OrderedDict()
+        self._catalog_lock = threading.Lock()
+
     def _process_json_response(self, response_text):
         """
         Process JSON response by stripping the while(1){} prefix
-        
+
         Adobe Lightroom API responses are prepended with while(1){} to mitigate abuse.
         This must be stripped before parsing JSON.
-        
+
         Args:
             response_text: Raw response text from API
-            
+
         Returns:
             dict: Parsed JSON object
         """
         if not response_text:
             return None
-        
+
         # Strip the while(1){} prefix using regex pattern from Adobe documentation
         # Pattern matches: while(1){} with optional whitespace
         while1_regex = re.compile(r'^while\s*\(\s*1\s*\)\s*{\s*}\s*', re.IGNORECASE)
         cleaned_text = while1_regex.sub('', response_text)
-        
+
         return json.loads(cleaned_text)
-    
+
     def _get_headers(self, access_token):
         """Get headers for API requests"""
         return {
@@ -62,7 +88,14 @@ class LightroomClient:
             'x-api-key': self.oauth_handler.client_id,
             'Content-Type': 'application/json'
         }
-    
+
+    def _validate_api_url(self, url):
+        """Only allow absolute URLs that point at the Lightroom API host."""
+        parsed = urlparse(url)
+        if parsed.scheme != 'https' or parsed.netloc != self.API_HOST:
+            raise InvalidInputError("URL does not point to the Lightroom API")
+        return url
+
     def _make_request(self, access_token, method, endpoint, **kwargs):
         """
         Make API request with error handling
@@ -79,7 +112,7 @@ class LightroomClient:
         # Support both relative endpoints and absolute URLs, per Adobe links/base docs:
         # https://developer.adobe.com/lightroom/lightroom-api-docs/guides/links_and_pagination/
         if endpoint.startswith("http://") or endpoint.startswith("https://"):
-            url = endpoint
+            url = self._validate_api_url(endpoint)
         else:
             url = f"{self.API_BASE_URL}{endpoint}"
 
@@ -94,7 +127,9 @@ class LightroomClient:
         if kwargs:
             logger.debug(f"Request kwargs: {kwargs}")
 
-        response = requests.request(method, url, headers=headers, verify=False, **kwargs)
+        response = requests.request(
+            method, url, headers=headers, verify=False, timeout=self.REQUEST_TIMEOUT, **kwargs
+        )
 
         # Log response details
         logger.info(f"Lightroom API Response: {response.status_code} from {method} {url}")
@@ -103,15 +138,16 @@ class LightroomClient:
 
         # Handle token expiration
         if response.status_code == 401:
-            logger.error(f"Access token expired for request to {url}")
-            raise Exception("Access token expired. Please re-authenticate.")
+            logger.error(f"Access token rejected for request to {url}")
+            raise TokenExpiredError("Access token expired. Please re-authenticate.")
 
         response.raise_for_status()
 
         # Process JSON response to strip while(1){} prefix
         # Adobe Lightroom API prepends this to all JSON responses
         resp = self._process_json_response(response.text)
-        logger.debug(f"Response body: \n{json.dumps(resp, indent=4)}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Response body: \n{json.dumps(resp, indent=4)}")
         return resp
 
     def _get_paged_resources(self, access_token, initial_endpoint):
@@ -144,23 +180,44 @@ class LightroomClient:
             resources.extend(page.get('resources', []))
 
         return resources
-    
+
     def get_catalog(self, access_token):
         """
-        Get user's catalog information
-        
+        Get the user's catalog information (cached per access token)
+
         Args:
             access_token: OAuth access token
-        
+
         Returns:
             dict: Catalog information
         """
-        if (self.catalog is not None):
-            return self.catalog
-        else:
-            self.catalog = self._make_request(access_token, 'GET', '/catalog')
-            return self.catalog
-    
+        key = hashlib.sha256(access_token.encode('utf-8')).hexdigest()
+
+        with self._catalog_lock:
+            catalog = self._catalog_cache.get(key)
+            if catalog is not None:
+                self._catalog_cache.move_to_end(key)
+                return catalog
+
+        catalog = self._make_request(access_token, 'GET', '/catalog')
+
+        if catalog:
+            with self._catalog_lock:
+                self._catalog_cache[key] = catalog
+                self._catalog_cache.move_to_end(key)
+                while len(self._catalog_cache) > self.CATALOG_CACHE_SIZE:
+                    self._catalog_cache.popitem(last=False)
+
+        return catalog
+
+    def _get_catalog_id(self, access_token):
+        catalog = self.get_catalog(access_token)
+        if not catalog:
+            raise Exception("Could not retrieve catalog")
+        catalog_id = catalog.get('id')
+        if not catalog_id:
+            raise Exception("Could not retrieve catalog ID")
+        return catalog_id
 
     def get_albums_page(self, access_token, limit=20, name_after=None):
         """
@@ -176,17 +233,13 @@ class LightroomClient:
                 - albums_list: List of album resources
                 - next_name_after: Value for name_after to get next page, or None if no more pages
         """
-        catalog = self.get_catalog(access_token)
-        if not catalog:
-            raise Exception("Could not retrieve catalog")
-        catalog_id = catalog.get('id')
-        if not catalog_id:
-            raise Exception("Could not retrieve catalog ID")
+        catalog_id = self._get_catalog_id(access_token)
 
-        # Build endpoint with name_after parameter if provided
-        endpoint = f'/catalogs/{catalog_id}/albums?limit={int(limit)}'
+        # urlencode so album names with &, #, spaces, etc. survive intact
+        params = {'limit': int(limit)}
         if name_after:
-            endpoint += f'&name_after={name_after}'
+            params['name_after'] = name_after
+        endpoint = f'/catalogs/{catalog_id}/albums?{urlencode(params)}'
 
         page = self._make_request(access_token, 'GET', endpoint)
 
@@ -201,47 +254,39 @@ class LightroomClient:
         next_name_after = None
         if links.get('next') and links['next'].get('href'):
             next_href = links['next']['href']
-            # Parse the next link to extract name_after parameter
+            # Parse the next link to extract name_after parameter (parse_qs decodes it)
             parsed = urlparse(urljoin(base, next_href))
             qs = parse_qs(parsed.query)
             if 'name_after' in qs and qs['name_after']:
                 next_name_after = qs['name_after'][0]
 
         return resources, next_name_after
-    
+
     def get_album(self, access_token, album_id):
         """
         Get specific album information
-        
+
         Args:
             access_token: OAuth access token
             album_id: Album ID
-        
+
         Returns:
             dict: Album information
         """
-        catalog = self.get_catalog(access_token)
-        if not catalog:
-            raise Exception("Could not retrieve catalog")
-        catalog_id = catalog.get('id')
-        if not catalog_id:
-            raise Exception("Could not retrieve catalog ID")
-        
+        _check_id(album_id, 'album id')
+        catalog_id = self._get_catalog_id(access_token)
         return self._make_request(access_token, 'GET', f'/catalogs/{catalog_id}/albums/{album_id}')
-    
 
     def get_album_assets_page(self, access_token, album_id, limit=20, page_url=None):
         """
         Get a single page of assets for an album with limit and pagination links.
         """
-        catalog = self.get_catalog(access_token)
-        if not catalog:
-            raise Exception("Could not retrieve catalog")
-        catalog_id = catalog.get('id')
-        if not catalog_id:
-            raise Exception("Could not retrieve catalog ID")
+        _check_id(album_id, 'album id')
+        catalog_id = self._get_catalog_id(access_token)
 
         if page_url:
+            # Raises InvalidInputError unless this is an https://lr.adobe.io URL
+            self._validate_api_url(page_url)
             page = self._make_request(access_token, 'GET', page_url)
         else:
             endpoint = f'/catalogs/{catalog_id}/albums/{album_id}/assets?limit={int(limit)}'
@@ -293,27 +338,19 @@ class LightroomClient:
         Returns:
             str: First asset ID or None if album is empty
         """
-        try:
-            catalog = self.get_catalog(access_token)
-            if not catalog:
-                raise Exception("Could not retrieve catalog")
-            catalog_id = catalog.get('id')
-            if not catalog_id:
-                raise Exception("Could not retrieve catalog ID")
+        _check_id(album_id, 'album id')
+        catalog_id = self._get_catalog_id(access_token)
 
-            # Fetch just the first asset (limit=1)
-            endpoint = f'/catalogs/{catalog_id}/albums/{album_id}/assets?limit=1'
-            page = self._make_request(access_token, 'GET', endpoint)
+        # Fetch just the first asset (limit=1)
+        endpoint = f'/catalogs/{catalog_id}/albums/{album_id}/assets?limit=1'
+        page = self._make_request(access_token, 'GET', endpoint)
 
-            if page and page.get('resources'):
-                first_asset = page['resources'][0]
-                # Extract asset ID from the resource structure
-                return first_asset.get('asset', {}).get('id')
+        if page and page.get('resources'):
+            first_asset = page['resources'][0]
+            # Extract asset ID from the resource structure
+            return first_asset.get('asset', {}).get('id')
 
-            return None
-        except Exception as e:
-            logger.warning(f"Failed to fetch first asset for album {album_id}: {str(e)}")
-            return None
+        return None
 
     def get_asset_rendition(self, access_token, asset_id, rendition_type='2048'):
         """
@@ -327,12 +364,9 @@ class LightroomClient:
         Returns:
             bytes: Image binary data
         """
-        catalog = self.get_catalog(access_token)
-        if not catalog:
-            raise Exception("Could not retrieve catalog")
-        catalog_id = catalog.get('id')
-        if not catalog_id:
-            raise Exception("Could not retrieve catalog ID")
+        _check_id(asset_id, 'asset id')
+        _check_id(rendition_type, 'rendition type')
+        catalog_id = self._get_catalog_id(access_token)
 
         url = f"{self.API_BASE_URL}/catalogs/{catalog_id}/assets/{asset_id}/renditions/{rendition_type}"
         headers = self._get_headers(access_token)
@@ -344,7 +378,7 @@ class LightroomClient:
         logger.info(f"Lightroom API Request: GET {url}")
         logger.debug(f"Request headers: {safe_headers}")
 
-        response = requests.get(url, headers=headers, verify=False)
+        response = requests.get(url, headers=headers, verify=False, timeout=self.REQUEST_TIMEOUT)
 
         # Log response
         logger.info(f"Lightroom API Response: {response.status_code} from GET {url}")
@@ -353,10 +387,9 @@ class LightroomClient:
 
         # Handle token expiration
         if response.status_code == 401:
-            logger.error(f"Access token expired for request to {url}")
-            raise Exception("Access token expired. Please re-authenticate.")
+            logger.error(f"Access token rejected for request to {url}")
+            raise TokenExpiredError("Access token expired. Please re-authenticate.")
 
         response.raise_for_status()
 
         return response.content
-

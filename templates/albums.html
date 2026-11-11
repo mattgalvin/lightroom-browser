@@ -3,27 +3,41 @@
 {% block title %}Albums - Lightroom Gallery{% endblock %}
 
 {% block content %}
+<script>
+// Album covers load lazily from the server; if one fails (e.g. an empty album), show a placeholder.
+document.addEventListener('error', function(event) {
+    const img = event.target;
+    if (img && img.tagName === 'IMG' && img.closest && img.closest('.album-thumbnail')) {
+        const wrapper = img.parentElement;
+        wrapper.classList.add('album-placeholder');
+        const span = document.createElement('span');
+        span.textContent = 'No Photos';
+        img.replaceWith(span);
+    }
+}, true);
+</script>
+
 <div class="albums-container">
     <h2>Your Albums</h2>
 
     {% if albums %}
         <div class="albums-grid" id="albums-grid">
             {% for album in albums %}
+            {% set payload = album.get('payload', album) %}
             <div class="album-card">
                 <a href="{{ url_for('album_view', album_id=album.id) }}">
-                    {% if album.get('first_asset_id') %}
-                    <div class="album-thumbnail">
-                        <img src="{{ url_for('thumbnail', asset_id=album.first_asset_id) }}"
-                             alt="{{ album.get('payload', album).get('name', 'Album') }}"
-                             loading="lazy">
-                    </div>
-                    {% else %}
+                    {% if payload.get('assetCount') == 0 %}
                     <div class="album-thumbnail album-placeholder">
                         <span>No Photos</span>
                     </div>
+                    {% else %}
+                    <div class="album-thumbnail">
+                        <img src="{{ url_for('album_cover', album_id=album.id) }}"
+                             alt="{{ payload.get('name', 'Album') }}"
+                             loading="lazy">
+                    </div>
                     {% endif %}
                     <div class="album-info">
-                        {% set payload = album.get('payload', album) %}
                         <h3>{{ payload.get('name', 'Untitled Album') }}</h3>
                         <p class="album-meta">
                             {% if payload.get('assetCount') %}
@@ -49,7 +63,7 @@
 
 <script>
 // Infinite scroll state for albums
-let nextNameAfter = {{ next_name_after|tojson if next_name_after else 'null' }};
+let nextNameAfter = {{ next_name_after|tojson }};
 let isLoadingAlbums = false;
 
 function createAlbumElement(album) {
@@ -57,23 +71,23 @@ function createAlbumElement(album) {
     albumCard.className = 'album-card';
 
     const albumLink = document.createElement('a');
-    albumLink.href = `/album/${album.id}`;
+    albumLink.href = `/album/${encodeURIComponent(album.id)}`;
 
     // Create thumbnail
     const albumThumbnail = document.createElement('div');
     albumThumbnail.className = 'album-thumbnail';
 
-    if (album.first_asset_id) {
-        const img = document.createElement('img');
-        img.src = `/thumbnail/${album.first_asset_id}`;
-        img.alt = album.name;
-        img.loading = 'lazy';
-        albumThumbnail.appendChild(img);
-    } else {
+    if (album.asset_count === 0) {
         albumThumbnail.className = 'album-thumbnail album-placeholder';
         const span = document.createElement('span');
         span.textContent = 'No Photos';
         albumThumbnail.appendChild(span);
+    } else {
+        const img = document.createElement('img');
+        img.src = `/api/album/${encodeURIComponent(album.id)}/cover`;
+        img.alt = album.name;
+        img.loading = 'lazy';
+        albumThumbnail.appendChild(img);
     }
 
     // Create album info
@@ -112,6 +126,9 @@ async function loadMoreAlbums() {
 
         if (data.error) {
             console.error('Error loading albums:', data.error);
+            if (response.status === 401) {
+                window.location.href = '/login';
+            }
             return;
         }
 
@@ -119,8 +136,7 @@ async function loadMoreAlbums() {
 
         // Add new albums to the grid
         data.albums.forEach(album => {
-            const albumElement = createAlbumElement(album);
-            albumsGrid.appendChild(albumElement);
+            albumsGrid.appendChild(createAlbumElement(album));
         });
 
         // Update next name_after
@@ -155,4 +171,3 @@ setTimeout(() => {
 }, 100);
 </script>
 {% endblock %}
-
