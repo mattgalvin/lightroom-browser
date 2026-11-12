@@ -11,7 +11,7 @@ A Python Flask web application that displays photos from Adobe Lightroom albums 
 
 ## Prerequisites
 
-- Python 3.7 or higher
+- Python 3.8 or higher
 - Adobe Developer Account
 - Lightroom account with photos
 
@@ -92,12 +92,79 @@ when `FLASK_DEBUG=True`, because the Werkzeug debugger must never be reachable f
 
 ## Running the Tests
 
+The test suite uses [pytest](https://docs.pytest.org/) and needs Python 3.8 or higher. It uses
+mocks only: it never contacts Adobe, never needs an Adobe account, and doesn't read your `.env`
+(the tests set their own dummy credentials). A test that tries to reach the network fails on purpose.
+
+### 1. Set up the test environment
+
+Run these from the project root (the folder that contains `app.py`). If you already ran
+`setup.sh` / `setup.bat`, the virtual environment exists and you only need to activate it and
+install the test dependencies (steps 2 and 3).
+
+**1. Create the virtual environment** (skip if `venv/` already exists):
+```bash
+python3 -m venv venv
+```
+
+**2. Activate it:**
+```bash
+# macOS/Linux/WSL:
+source venv/bin/activate
+# Windows (cmd):
+venv\Scripts\activate
+```
+
+**3. Install the app and test dependencies** (`requirements-dev.txt` includes `requirements.txt`):
 ```bash
 pip install -r requirements-dev.txt
+```
+
+### 2. Run the tests
+
+```bash
 python -m pytest tests
 ```
 
-The tests use mocks only: they never contact Adobe and never read your real credentials.
+A passing run looks like this (the count grows as tests are added):
+
+```
+tests/test_auth_flow.py ................................                 [ 34%]
+tests/test_client.py .......................                             [ 58%]
+tests/test_helpers.py .......................................            [100%]
+
+============================== 94 passed in 1.3s ==============================
+```
+
+Each dot is a passing test. If something fails, pytest prints the failing test, the line that
+failed and the values involved, and the run ends with `N failed, M passed`.
+
+Useful variations:
+
+```bash
+python -m pytest tests -v                         # list every test by name
+python -m pytest tests -x                         # stop at the first failure
+python -m pytest tests/test_client.py             # run a single file
+python -m pytest tests -k "redirect"              # run tests whose name contains "redirect"
+python -m pytest "tests/test_helpers.py::test_check_id_rejects_everything_else"   # one test
+python -m pytest tests -q -rf                     # short output, list failures at the end
+```
+
+### What the tests cover
+
+| File | Covers |
+|------|--------|
+| `tests/test_helpers.py` | ID and URL validation, the token expiry parsing (seconds vs. milliseconds), the server-side token store, log sanitizing, bind-address safety check |
+| `tests/test_client.py` | The Lightroom API client: redirect handling, 401/429 handling, URL encoding, the catalog and cover caches, the cap on concurrent Adobe calls |
+| `tests/test_auth_flow.py` | The Flask app: OAuth state checks, server-side sessions, token refresh (including parallel requests and transient failures), error pages, cache headers, HTML escaping |
+
+### Troubleshooting
+
+- **`No module named pytest`** (or `flask`, `requests`...): the virtual environment isn't active
+  or the dependencies aren't installed. Repeat steps 2 and 3. Using `python -m pytest` rather
+  than `pytest` makes sure the active environment's pytest is the one that runs.
+- **A `lightroom_gallery.log` file appears:** importing the app creates its log file in the current
+  directory. It is git-ignored and safe to delete.
 
 ## Usage
 

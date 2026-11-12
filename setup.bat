@@ -7,7 +7,7 @@ echo Setting up Lightroom Gallery application...
 REM Check if Python is available
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo Error: Python is not installed or not in PATH. Please install Python 3.7 or higher.
+    echo Error: Python is not installed or not in PATH. Please install Python 3.8 or higher.
     exit /b 1
 )
 
