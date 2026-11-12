@@ -6,6 +6,7 @@ Handles API calls to Adobe Lightroom API
 import re
 import json
 import hashlib
+import time
 import logging
 import threading
 from collections import OrderedDict
@@ -23,6 +24,14 @@ class TokenExpiredError(Exception):
 
 class InvalidInputError(Exception):
     """Raised when a caller-supplied ID or URL is not acceptable."""
+
+
+class RateLimitedError(Exception):
+    """Raised when the Lightroom API answers HTTP 429. `retry_after` is in seconds."""
+
+    def __init__(self, retry_after=5):
+        super().__init__(f"Lightroom API rate limit hit (retry after {retry_after}s)")
+        self.retry_after = retry_after
 
 
 _ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
@@ -45,17 +54,37 @@ class LightroomClient:
     REQUEST_TIMEOUT = 30
     CATALOG_CACHE_SIZE = 256
 
-    def __init__(self, oauth_handler):
+    # An album's first asset (used for its cover) rarely changes, so remember it
+    FIRST_ASSET_TTL = 600  # seconds
+    FIRST_ASSET_CACHE_SIZE = 4096
+
+    def __init__(self, oauth_handler, max_concurrent_requests=4):
         """
         Initialize Lightroom client
 
         Args:
             oauth_handler: OAuthHandler instance for authentication
+            max_concurrent_requests: cap on simultaneous calls to Adobe, so a page full of
+                                     covers/thumbnails can't trip Adobe's rate limits
         """
         self.oauth_handler = oauth_handler
         # Catalogs are per user, so cache them per access token (LRU-bounded)
         self._catalog_cache = OrderedDict()
         self._catalog_lock = threading.Lock()
+        # (catalog_id, album_id) -> (expires_at, first_asset_id or None); LRU-bounded
+        self._first_asset_cache = OrderedDict()
+        self._first_asset_lock = threading.Lock()
+        self._api_slots = threading.BoundedSemaphore(max_concurrent_requests)
+
+    @staticmethod
+    def _raise_if_rate_limited(response):
+        if response.status_code == 429:
+            try:
+                retry_after = int(response.headers.get('Retry-After', 5))
+            except (TypeError, ValueError):
+                retry_after = 5
+            logger.warning(f"Lightroom API rate limit hit (Retry-After {retry_after}s)")
+            raise RateLimitedError(retry_after)
 
     def _process_json_response(self, response_text):
         """
@@ -127,9 +156,10 @@ class LightroomClient:
         if kwargs:
             logger.debug(f"Request kwargs: {kwargs}")
 
-        response = requests.request(
-            method, url, headers=headers, verify=False, timeout=self.REQUEST_TIMEOUT, **kwargs
-        )
+        with self._api_slots:
+            response = requests.request(
+                method, url, headers=headers, verify=False, timeout=self.REQUEST_TIMEOUT, **kwargs
+            )
 
         # Log response details
         logger.info(f"Lightroom API Response: {response.status_code} from {method} {url}")
@@ -141,6 +171,7 @@ class LightroomClient:
             logger.error(f"Access token rejected for request to {url}")
             raise TokenExpiredError("Access token expired. Please re-authenticate.")
 
+        self._raise_if_rate_limited(response)
         response.raise_for_status()
 
         # Process JSON response to strip while(1){} prefix
@@ -341,16 +372,32 @@ class LightroomClient:
         _check_id(album_id, 'album id')
         catalog_id = self._get_catalog_id(access_token)
 
+        # Catalogs are per user, so this key is safe to share across requests
+        key = (catalog_id, album_id)
+        with self._first_asset_lock:
+            cached = self._first_asset_cache.get(key)
+            if cached is not None and cached[0] > time.monotonic():
+                self._first_asset_cache.move_to_end(key)
+                return cached[1]
+
         # Fetch just the first asset (limit=1)
         endpoint = f'/catalogs/{catalog_id}/albums/{album_id}/assets?limit=1'
         page = self._make_request(access_token, 'GET', endpoint)
 
+        asset_id = None
         if page and page.get('resources'):
             first_asset = page['resources'][0]
             # Extract asset ID from the resource structure
-            return first_asset.get('asset', {}).get('id')
+            asset_id = first_asset.get('asset', {}).get('id')
 
-        return None
+        # Cache empty albums too (asset_id None) so they don't re-query on every page view
+        with self._first_asset_lock:
+            self._first_asset_cache[key] = (time.monotonic() + self.FIRST_ASSET_TTL, asset_id)
+            self._first_asset_cache.move_to_end(key)
+            while len(self._first_asset_cache) > self.FIRST_ASSET_CACHE_SIZE:
+                self._first_asset_cache.popitem(last=False)
+
+        return asset_id
 
     def get_asset_rendition(self, access_token, asset_id, rendition_type='2048'):
         """
@@ -378,7 +425,8 @@ class LightroomClient:
         logger.info(f"Lightroom API Request: GET {url}")
         logger.debug(f"Request headers: {safe_headers}")
 
-        response = requests.get(url, headers=headers, verify=False, timeout=self.REQUEST_TIMEOUT)
+        with self._api_slots:
+            response = requests.get(url, headers=headers, verify=False, timeout=self.REQUEST_TIMEOUT)
 
         # Log response
         logger.info(f"Lightroom API Response: {response.status_code} from GET {url}")
@@ -390,6 +438,7 @@ class LightroomClient:
             logger.error(f"Access token rejected for request to {url}")
             raise TokenExpiredError("Access token expired. Please re-authenticate.")
 
+        self._raise_if_rate_limited(response)
         response.raise_for_status()
 
         return response.content

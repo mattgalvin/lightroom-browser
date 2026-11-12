@@ -12,7 +12,7 @@ import requests
 from flask import Flask, render_template, redirect, url_for, session, request, Response, g
 from werkzeug.exceptions import HTTPException
 from dotenv import load_dotenv
-from lightroom_client import LightroomClient, TokenExpiredError, InvalidInputError
+from lightroom_client import LightroomClient, TokenExpiredError, InvalidInputError, RateLimitedError
 from oauth_handler import OAuthHandler
 from token_store import TokenStore
 
@@ -41,6 +41,10 @@ PHOTOS_PER_PAGE = int(os.getenv('PHOTOS_PER_PAGE', '20'))
 
 # Refresh the access token this many seconds before it actually expires
 TOKEN_REFRESH_MARGIN = 60
+
+# Let the browser cache images so revisiting an album doesn't hit Adobe again
+THUMBNAIL_CACHE_SECONDS = 3600
+COVER_CACHE_SECONDS = 600
 
 # Secret key: never run with a well-known value
 PLACEHOLDER_SECRET_KEYS = {
@@ -186,6 +190,13 @@ def handle_transient_auth_error(e):
     logger.warning("Transient authentication failure: %s (cause: %r)", e, e.__cause__)
     body, status = _error_response("Adobe is temporarily unavailable. Please try again in a moment.", 503)
     return body, status, {'Retry-After': '5'}
+
+
+@app.errorhandler(RateLimitedError)
+def handle_rate_limited(e):
+    retry_after = min(max(int(e.retry_after), 1), 30)
+    body, status = _error_response("Adobe is rate limiting requests. Please try again shortly.", 429)
+    return body, status, {'Retry-After': str(retry_after)}
 
 
 @app.errorhandler(InvalidInputError)
@@ -344,7 +355,7 @@ def album_cover(album_id):
         g.access_token, asset_id, rendition_type='thumbnail2x'
     )
     response = Response(image_data, mimetype='image/jpeg')
-    response.headers['Cache-Control'] = 'private, max-age=300'
+    response.headers['Cache-Control'] = f'private, max-age={COVER_CACHE_SECONDS}'
     return response
 
 
@@ -403,7 +414,9 @@ def thumbnail(asset_id):
         g.access_token, asset_id, rendition_type=rendition_type
     )
 
-    return Response(image_data, mimetype='image/jpeg')
+    response = Response(image_data, mimetype='image/jpeg')
+    response.headers['Cache-Control'] = f'private, max-age={THUMBNAIL_CACHE_SECONDS}'
+    return response
 
 
 @app.route('/logout')
