@@ -9,21 +9,19 @@
     {% if albums %}
         <div class="albums-grid" id="albums-grid">
             {% for album in albums %}
+            {% set payload = album.get('payload', album) %}
             <div class="album-card">
                 <a href="{{ url_for('album_view', album_id=album.id) }}">
-                    {% if album.get('first_asset_id') %}
-                    <div class="album-thumbnail">
-                        <img src="{{ url_for('thumbnail', asset_id=album.first_asset_id) }}"
-                             alt="{{ album.get('payload', album).get('name', 'Album') }}"
-                             loading="lazy">
-                    </div>
-                    {% else %}
+                    {% if payload.get('assetCount') == 0 %}
                     <div class="album-thumbnail album-placeholder">
                         <span>No Photos</span>
                     </div>
+                    {% else %}
+                    <div class="album-thumbnail"
+                         data-cover-src="{{ url_for('album_cover', album_id=album.id) }}"
+                         data-album-name="{{ payload.get('name', 'Album') }}"></div>
                     {% endif %}
                     <div class="album-info">
-                        {% set payload = album.get('payload', album) %}
                         <h3>{{ payload.get('name', 'Untitled Album') }}</h3>
                         <p class="album-meta">
                             {% if payload.get('assetCount') %}
@@ -48,8 +46,107 @@
 </div>
 
 <script>
-// Infinite scroll state for albums
-let nextNameAfter = {{ next_name_after|tojson if next_name_after else 'null' }};
+// ---- Album cover loader -------------------------------------------------
+// Covers are fetched with fetch() (not <img src>) so we can see the HTTP status and react
+// properly: 404 = empty album, 401 = session expired, 429/5xx/network = retry with backoff.
+// Requests start only when a cover is near the viewport, and only a few run at once, so a
+// big page of albums doesn't flood the server (and, through it, Adobe's API).
+const COVER_MAX_CONCURRENT = 3;
+const COVER_MAX_RETRIES = 3;
+const coverQueue = [];
+let coversInFlight = 0;
+
+function setCoverPlaceholder(container, message) {
+    container.classList.add('album-placeholder');
+    const span = document.createElement('span');
+    span.textContent = message;
+    container.replaceChildren(span);
+}
+
+function enqueueCover(container, attempt) {
+    coverQueue.push({ container: container, attempt: attempt || 0 });
+    pumpCoverQueue();
+}
+
+function pumpCoverQueue() {
+    while (coversInFlight < COVER_MAX_CONCURRENT && coverQueue.length > 0) {
+        const job = coverQueue.shift();
+        coversInFlight++;
+        loadCover(job).finally(() => {
+            coversInFlight--;
+            pumpCoverQueue();
+        });
+    }
+}
+
+function retryCoverLater(job, response) {
+    if (job.attempt >= COVER_MAX_RETRIES) {
+        setCoverPlaceholder(job.container, 'Cover unavailable');
+        return;
+    }
+    // Honour Retry-After (e.g. on a 429); otherwise back off 1s, 2s, 4s
+    let delayMs = 1000 * Math.pow(2, job.attempt);
+    const retryAfter = response ? parseInt(response.headers.get('Retry-After'), 10) : NaN;
+    if (!isNaN(retryAfter)) {
+        delayMs = Math.min(Math.max(retryAfter, 1), 30) * 1000;
+    }
+    setTimeout(() => enqueueCover(job.container, job.attempt + 1), delayMs);
+}
+
+async function loadCover(job) {
+    const container = job.container;
+    let response;
+    try {
+        response = await fetch(container.dataset.coverSrc, { credentials: 'same-origin' });
+    } catch (error) {
+        retryCoverLater(job, null);
+        return;
+    }
+
+    if (response.ok) {
+        try {
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const img = document.createElement('img');
+            img.alt = container.dataset.albumName || 'Album';
+            img.onload = img.onerror = () => URL.revokeObjectURL(url);
+            img.src = url;
+            container.replaceChildren(img);
+        } catch (error) {
+            retryCoverLater(job, null);
+        }
+    } else if (response.status === 404) {
+        setCoverPlaceholder(container, 'No Photos');
+    } else if (response.status === 401) {
+        window.location.href = '/login';
+    } else {
+        retryCoverLater(job, response);
+    }
+}
+
+const coverObserver = ('IntersectionObserver' in window)
+    ? new IntersectionObserver((entries, observer) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                observer.unobserve(entry.target);
+                enqueueCover(entry.target, 0);
+            }
+        });
+    }, { rootMargin: '200px' })
+    : null;
+
+function observeCover(container) {
+    if (coverObserver) {
+        coverObserver.observe(container);
+    } else {
+        enqueueCover(container, 0);
+    }
+}
+
+document.querySelectorAll('.album-thumbnail[data-cover-src]').forEach(observeCover);
+
+// ---- Infinite scroll for albums -----------------------------------------
+let nextNameAfter = {{ next_name_after|tojson }};
 let isLoadingAlbums = false;
 
 function createAlbumElement(album) {
@@ -57,23 +154,21 @@ function createAlbumElement(album) {
     albumCard.className = 'album-card';
 
     const albumLink = document.createElement('a');
-    albumLink.href = `/album/${album.id}`;
+    albumLink.href = `/album/${encodeURIComponent(album.id)}`;
 
     // Create thumbnail
     const albumThumbnail = document.createElement('div');
     albumThumbnail.className = 'album-thumbnail';
 
-    if (album.first_asset_id) {
-        const img = document.createElement('img');
-        img.src = `/thumbnail/${album.first_asset_id}`;
-        img.alt = album.name;
-        img.loading = 'lazy';
-        albumThumbnail.appendChild(img);
-    } else {
+    if (album.asset_count === 0) {
         albumThumbnail.className = 'album-thumbnail album-placeholder';
         const span = document.createElement('span');
         span.textContent = 'No Photos';
         albumThumbnail.appendChild(span);
+    } else {
+        // The cover loader picks this up (see observeCover)
+        albumThumbnail.dataset.coverSrc = `/api/album/${encodeURIComponent(album.id)}/cover`;
+        albumThumbnail.dataset.albumName = album.name;
     }
 
     // Create album info
@@ -112,6 +207,9 @@ async function loadMoreAlbums() {
 
         if (data.error) {
             console.error('Error loading albums:', data.error);
+            if (response.status === 401) {
+                window.location.href = '/login';
+            }
             return;
         }
 
@@ -121,6 +219,8 @@ async function loadMoreAlbums() {
         data.albums.forEach(album => {
             const albumElement = createAlbumElement(album);
             albumsGrid.appendChild(albumElement);
+            const thumb = albumElement.querySelector('.album-thumbnail[data-cover-src]');
+            if (thumb) observeCover(thumb);
         });
 
         // Update next name_after
@@ -155,4 +255,3 @@ setTimeout(() => {
 }, 100);
 </script>
 {% endblock %}
-

@@ -16,33 +16,18 @@
         <div class="photo-grid" id="photo-grid">
             {% for photo in photos %}
             <div class="photo-item">
-                {% set asset_id = photo.get('asset', {}).get('id') %}
-                {% if asset_id %}
-                    <a href="#"
-                       class="photo-link"
-                       data-asset-id="{{ asset_id }}"
-                       data-filename="{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}"
-                       onclick="openLightbox('{{ asset_id }}', '{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}'); return false;">
-                        <img src="{{ url_for('thumbnail', asset_id=asset_id) }}"
-                             alt="{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}"
-                             class="photo-thumbnail"
-                             loading="lazy">
-                        <div class="photo-info">
-                            {% if photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName') %}
-                            <p class="photo-filename">{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}</p>
-                            {% endif %}
-                        </div>
-                    </a>
-                {% else %}
-                    <div class="photo-placeholder">
-                        {% if photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName') %}
-                        <p>{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}</p>
-                        {% else %}
-                        <p>Photo</p>
-                        {% endif %}
-                        <small>ID: {{ photo.get('asset', {}).get('id', 'Unknown') }}</small>
+                <a href="#"
+                   class="photo-link"
+                   data-asset-id="{{ photo.asset_id }}"
+                   data-filename="{{ photo.filename }}">
+                    <img src="{{ url_for('thumbnail', asset_id=photo.asset_id) }}"
+                         alt="{{ photo.filename }}"
+                         class="photo-thumbnail"
+                         loading="lazy">
+                    <div class="photo-info">
+                        <p class="photo-filename">{{ photo.filename }}</p>
                     </div>
-                {% endif %}
+                </a>
             </div>
             {% endfor %}
         </div>
@@ -69,25 +54,22 @@
 </div>
 
 <script>
+// All server values are passed through |tojson so they are safely escaped for JavaScript.
+const THUMBNAIL_URL_TEMPLATE = {{ url_for('thumbnail', asset_id='ASSET_ID')|tojson }};
+const albumId = {{ album_id|tojson }};
+
+function thumbnailUrl(assetId) {
+    return THUMBNAIL_URL_TEMPLATE.replace('ASSET_ID', encodeURIComponent(assetId));
+}
+
 // Build array of photos for navigation
-let photos = [
-    {% for photo in photos %}
-    {% set asset_id = photo.get('asset', {}).get('id') %}
-    {% if asset_id %}
-    {
-        assetId: '{{ asset_id }}',
-        filename: '{{ photo.get('asset', {}).get('payload', {}).get('importSource', {}).get('fileName', 'Photo') }}'
-    }{% if not loop.last %},{% endif %}
-    {% endif %}
-    {% endfor %}
-];
+let photos = {{ photos|tojson }}.map(p => ({ assetId: p.asset_id, filename: p.filename }));
 
 let currentPhotoIndex = -1;
 
 // Infinite scroll state
-let nextPageUrl = {{ next_url|tojson if next_url else 'null' }};
+let nextPageUrl = {{ next_url|tojson }};
 let isLoading = false;
-const albumId = '{{ album_id }}';
 
 function createPhotoElement(assetId, filename) {
     const photoItem = document.createElement('div');
@@ -98,13 +80,9 @@ function createPhotoElement(assetId, filename) {
     photoLink.className = 'photo-link';
     photoLink.dataset.assetId = assetId;
     photoLink.dataset.filename = filename;
-    photoLink.onclick = function() {
-        openLightbox(assetId, filename);
-        return false;
-    };
 
     const img = document.createElement('img');
-    img.src = "{{ url_for('thumbnail', asset_id='ASSET_ID') }}".replace('ASSET_ID', assetId);
+    img.src = thumbnailUrl(assetId);
     img.alt = filename;
     img.className = 'photo-thumbnail';
     img.loading = 'lazy';
@@ -124,6 +102,17 @@ function createPhotoElement(assetId, filename) {
     return photoItem;
 }
 
+// One delegated click handler covers both server-rendered and infinitely-loaded photos
+const photoGridEl = document.getElementById('photo-grid');
+if (photoGridEl) {
+    photoGridEl.addEventListener('click', function(event) {
+        const link = event.target.closest('.photo-link');
+        if (!link) return;
+        event.preventDefault();
+        openLightbox(link.dataset.assetId, link.dataset.filename);
+    });
+}
+
 async function loadMorePhotos() {
     if (!nextPageUrl || isLoading) return;
 
@@ -132,11 +121,14 @@ async function loadMorePhotos() {
     loadingIndicator.style.display = 'block';
 
     try {
-        const response = await fetch(`/api/album/${albumId}/photos?page_url=${encodeURIComponent(nextPageUrl)}`);
+        const response = await fetch(`/api/album/${encodeURIComponent(albumId)}/photos?page_url=${encodeURIComponent(nextPageUrl)}`);
         const data = await response.json();
 
         if (data.error) {
             console.error('Error loading photos:', data.error);
+            if (response.status === 401) {
+                window.location.href = '/login';
+            }
             return;
         }
 
@@ -144,8 +136,7 @@ async function loadMorePhotos() {
 
         // Add new photos to the grid
         data.photos.forEach(photo => {
-            const photoElement = createPhotoElement(photo.asset_id, photo.filename);
-            photoGrid.appendChild(photoElement);
+            photoGrid.appendChild(createPhotoElement(photo.asset_id, photo.filename));
 
             // Add to photos array for lightbox navigation
             photos.push({
@@ -208,7 +199,7 @@ function loadImage(assetId, filename) {
     image.style.display = 'none';
 
     // Build full-size image URL
-    const imageUrl = "{{ url_for('thumbnail', asset_id='ASSET_ID') }}".replace('ASSET_ID', assetId) + '?type=2048';
+    const imageUrl = thumbnailUrl(assetId) + '?type=2048';
 
     // Load the image
     image.src = imageUrl;
@@ -297,4 +288,3 @@ document.addEventListener('keydown', function(event) {
 });
 </script>
 {% endblock %}
-

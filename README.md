@@ -86,7 +86,18 @@ venv\Scripts\activate
 python app.py
 ```
 
-The application will start on `https://localhost:8443` (HTTPS)
+The application will start on `https://localhost:8443` (HTTPS). By default it listens on
+`127.0.0.1` only; set `HOST=0.0.0.0` in `.env` to expose it on your network (this is refused
+when `FLASK_DEBUG=True`, because the Werkzeug debugger must never be reachable from the network).
+
+## Running the Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+The tests use mocks only: they never contact Adobe and never read your real credentials.
 
 ## Usage
 
@@ -103,7 +114,10 @@ lightroom_gallery/
 ├── app.py                 # Main Flask application
 ├── oauth_handler.py       # OAuth2 authentication handler
 ├── lightroom_client.py    # Lightroom API client
+├── token_store.py         # Server-side storage for Adobe tokens
+├── tests/                 # pytest suite (no network access needed)
 ├── requirements.txt       # Python dependencies
+├── requirements-dev.txt   # Test dependencies
 ├── setup.sh              # Setup script (macOS/Linux)
 ├── setup.bat             # Setup script (Windows)
 ├── venv/                 # Virtual environment (created by setup)
@@ -129,6 +143,7 @@ lightroom_gallery/
 - Use a strong `FLASK_SECRET_KEY` in production
 - The redirect URI in `.env` must exactly match the one configured in Adobe Console
 - For production deployments, use HTTPS and update the redirect URI accordingly
+- Adobe access/refresh tokens are kept server-side (`token_store.py`); the browser cookie only holds a random session id. The store is in memory and per process, so restarting the app logs everyone out, and running multiple worker processes would need a shared store (e.g. Redis)
 
 ## Troubleshooting
 
