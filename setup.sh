@@ -8,7 +8,7 @@ echo "Setting up Lightroom Gallery application..."
 
 # Check if Python 3 is available
 if ! command -v python3 &> /dev/null; then
-    echo "Error: Python 3 is not installed. Please install Python 3.7 or higher."
+    echo "Error: Python 3 is not installed. Please install Python 3.8 or higher."
     exit 1
 fi
 
