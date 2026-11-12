@@ -26,6 +26,10 @@ class InvalidInputError(Exception):
     """Raised when a caller-supplied ID or URL is not acceptable."""
 
 
+class UnexpectedRedirectError(Exception):
+    """Raised when the Lightroom API redirects somewhere we refuse to follow."""
+
+
 class RateLimitedError(Exception):
     """Raised when the Lightroom API answers HTTP 429. `retry_after` is in seconds."""
 
@@ -39,7 +43,8 @@ _ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 
 def _check_id(value, what='id'):
     """Make sure an ID is safe to place in an API URL path."""
-    if not isinstance(value, str) or not _ID_RE.match(value):
+    # fullmatch, not match: with `$`, "abc\n" would slip through
+    if not isinstance(value, str) or not _ID_RE.fullmatch(value):
         raise InvalidInputError(f"Invalid {what}")
     return value
 
@@ -57,6 +62,10 @@ class LightroomClient:
     # An album's first asset (used for its cover) rarely changes, so remember it
     FIRST_ASSET_TTL = 600  # seconds
     FIRST_ASSET_CACHE_SIZE = 4096
+
+    # Redirects are followed by hand, and only to https://lr.adobe.io (see _send)
+    MAX_REDIRECTS = 3
+    _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
     def __init__(self, oauth_handler, max_concurrent_requests=4):
         """
@@ -118,8 +127,44 @@ class LightroomClient:
             'Content-Type': 'application/json'
         }
 
+    def _send(self, method, url, headers, **kwargs):
+        """
+        Send a request to the Lightroom API.
+
+        `requests` would follow redirects on its own and, on a cross-host redirect, drop
+        Authorization but still send the x-api-key header. So automatic redirects are off
+        here: a redirect is followed only if it stays on https://lr.adobe.io (credentials
+        never leave that host); anything else is refused.
+        """
+        for _ in range(self.MAX_REDIRECTS + 1):
+            with self._api_slots:
+                response = requests.request(
+                    method, url, headers=headers, verify=False, timeout=self.REQUEST_TIMEOUT,
+                    allow_redirects=False, **kwargs
+                )
+
+            if response.status_code not in self._REDIRECT_STATUSES:
+                return response
+
+            location = response.headers.get('Location')
+            if not location:
+                raise UnexpectedRedirectError("Lightroom API sent a redirect without a Location")
+            target = urljoin(url, location)
+            try:
+                self._validate_api_url(target)
+            except InvalidInputError:
+                logger.error(f"Refusing redirect from {url} to host {urlparse(target).netloc!r}")
+                raise UnexpectedRedirectError("Lightroom API redirected to an unexpected host")
+            logger.info(f"Following redirect to {target}")
+            url = target
+
+        raise UnexpectedRedirectError("Too many redirects from the Lightroom API")
+
     def _validate_api_url(self, url):
         """Only allow absolute URLs that point at the Lightroom API host."""
+        # Control characters have no place in a URL (and would allow log/header injection)
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in url):
+            raise InvalidInputError("URL contains control characters")
         parsed = urlparse(url)
         if parsed.scheme != 'https' or parsed.netloc != self.API_HOST:
             raise InvalidInputError("URL does not point to the Lightroom API")
@@ -156,10 +201,7 @@ class LightroomClient:
         if kwargs:
             logger.debug(f"Request kwargs: {kwargs}")
 
-        with self._api_slots:
-            response = requests.request(
-                method, url, headers=headers, verify=False, timeout=self.REQUEST_TIMEOUT, **kwargs
-            )
+        response = self._send(method, url, headers, **kwargs)
 
         # Log response details
         logger.info(f"Lightroom API Response: {response.status_code} from {method} {url}")
@@ -222,7 +264,7 @@ class LightroomClient:
         Returns:
             dict: Catalog information
         """
-        key = hashlib.sha256(access_token.encode('utf-8')).hexdigest()
+        key = self._token_key(access_token)
 
         with self._catalog_lock:
             catalog = self._catalog_cache.get(key)
@@ -240,6 +282,28 @@ class LightroomClient:
                     self._catalog_cache.popitem(last=False)
 
         return catalog
+
+    @staticmethod
+    def _token_key(access_token):
+        return hashlib.sha256(access_token.encode('utf-8')).hexdigest()
+
+    def carry_over_catalog(self, old_access_token, new_access_token):
+        """
+        Keep a user's cached catalog across a token refresh. The user is the same, only the
+        token changed, so the catalog must not be refetched every time the token is renewed.
+        """
+        old_key = self._token_key(old_access_token)
+        new_key = self._token_key(new_access_token)
+        with self._catalog_lock:
+            catalog = self._catalog_cache.pop(old_key, None)
+            if catalog is not None:
+                self._catalog_cache[new_key] = catalog
+                self._catalog_cache.move_to_end(new_key)
+
+    def forget_catalog(self, access_token):
+        """Drop the cached catalog for a token (called on logout)."""
+        with self._catalog_lock:
+            self._catalog_cache.pop(self._token_key(access_token), None)
 
     def _get_catalog_id(self, access_token):
         catalog = self.get_catalog(access_token)
@@ -312,12 +376,15 @@ class LightroomClient:
         """
         Get a single page of assets for an album with limit and pagination links.
         """
+        # Validate caller input before spending any Adobe calls on it
         _check_id(album_id, 'album id')
-        catalog_id = self._get_catalog_id(access_token)
-
         if page_url:
             # Raises InvalidInputError unless this is an https://lr.adobe.io URL
             self._validate_api_url(page_url)
+
+        catalog_id = self._get_catalog_id(access_token)
+
+        if page_url:
             page = self._make_request(access_token, 'GET', page_url)
         else:
             endpoint = f'/catalogs/{catalog_id}/albums/{album_id}/assets?limit={int(limit)}'
@@ -425,8 +492,7 @@ class LightroomClient:
         logger.info(f"Lightroom API Request: GET {url}")
         logger.debug(f"Request headers: {safe_headers}")
 
-        with self._api_slots:
-            response = requests.get(url, headers=headers, verify=False, timeout=self.REQUEST_TIMEOUT)
+        response = self._send('GET', url, headers)
 
         # Log response
         logger.info(f"Lightroom API Response: {response.status_code} from GET {url}")

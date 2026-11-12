@@ -104,8 +104,12 @@ def inject_login_state():
 
 
 def end_session():
-    """Forget the stored tokens and clear the cookie session."""
-    token_store.delete(session.get('sid'))
+    """Forget the stored tokens (and the cached catalog) and clear the cookie session."""
+    sid = session.get('sid')
+    entry = token_store.get(sid)
+    if entry is not None:
+        lightroom_client.forget_catalog(entry.access_token)
+    token_store.delete(sid)
     session.clear()
 
 
@@ -137,6 +141,7 @@ def get_valid_access_token():
             end_session()
             return None
 
+        old_access_token = entry.access_token
         try:
             entry.update(oauth_handler.refresh_access_token(entry.refresh_token))
         except requests.HTTPError as e:
@@ -149,6 +154,8 @@ def get_valid_access_token():
         except requests.RequestException as e:
             raise TransientAuthError("Token refresh failed (network error)") from e
 
+        # Same user, new token: keep the cached catalog instead of refetching it every refresh
+        lightroom_client.carry_over_catalog(old_access_token, entry.access_token)
         return entry.access_token
 
 
@@ -209,13 +216,18 @@ def handle_unexpected_error(e):
     if isinstance(e, HTTPException):
         return e
     # Full details go to the log; the browser only gets a generic message
-    logger.exception("Unhandled error on %s %s", request.method, request.path)
+    logger.exception("Unhandled error on %s %r", request.method, request.path)
     return _error_response("Something went wrong. Please try again.", 500)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def log_safe(value, limit=200):
+    """Render untrusted input for a log line: truncated, and repr'd so newlines can't forge entries."""
+    return repr((value or '')[:limit])
+
 
 def simplify_photos(photos):
     """Reduce asset resources to the fields the templates and JS need."""
@@ -274,7 +286,10 @@ def callback():
     expected_state = session.pop('oauth_state', None)
 
     if error:
-        logger.warning("Adobe returned an OAuth error: %s (%s)", error, request.args.get('error_description'))
+        logger.warning(
+            "Adobe returned an OAuth error: %s (%s)",
+            log_safe(error), log_safe(request.args.get('error_description'))
+        )
         return "Authentication failed. Please try signing in again.", 400
 
     if not expected_state or not state or not secrets.compare_digest(state, expected_state):
@@ -426,9 +441,27 @@ def logout():
     return redirect(url_for('login'))
 
 
+LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1'}
+
+
+def resolve_bind_host(host, debug):
+    """
+    Pick the address to listen on. The Werkzeug debugger allows code execution, so it must
+    never be reachable from the network: debug mode is refused on a non-loopback address.
+    """
+    if debug and host not in LOOPBACK_HOSTS:
+        raise SystemExit(
+            f"Refusing to run with FLASK_DEBUG=true on {host!r}: the Werkzeug debugger would be "
+            "reachable from the network. Set HOST=127.0.0.1 or turn debug off."
+        )
+    return host
+
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8443))
     debug = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    # Listen on localhost only by default; set HOST=0.0.0.0 to expose the app on the network
+    host = resolve_bind_host(os.getenv('HOST', '127.0.0.1'), debug)
 
     # SSL configuration
     cert_file = os.getenv('SSL_CERT_FILE', 'cert.pem')
@@ -447,4 +480,4 @@ if __name__ == '__main__':
         print("For production, provide SSL certificates via SSL_CERT_FILE and SSL_KEY_FILE environment variables.")
         print(f"Expected files: {cert_file}, {key_file}")
 
-    app.run(host='0.0.0.0', port=port, debug=debug, ssl_context=ssl_context)
+    app.run(host=host, port=port, debug=debug, ssl_context=ssl_context)
