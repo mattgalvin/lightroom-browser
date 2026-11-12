@@ -129,6 +129,7 @@ lightroom_gallery/
 - Use a strong `FLASK_SECRET_KEY` in production
 - The redirect URI in `.env` must exactly match the one configured in Adobe Console
 - For production deployments, use HTTPS and update the redirect URI accordingly
+- Adobe access/refresh tokens are kept server-side (`token_store.py`); the browser cookie only holds a random session id. The store is in memory and per process, so restarting the app logs everyone out, and running multiple worker processes would need a shared store (e.g. Redis)
 
 ## Troubleshooting
 

@@ -4,16 +4,17 @@ Main Flask application for displaying photos from Adobe Lightroom albums
 """
 
 import os
-import time
 import secrets
 import logging
 from functools import wraps
 
+import requests
 from flask import Flask, render_template, redirect, url_for, session, request, Response, g
 from werkzeug.exceptions import HTTPException
 from dotenv import load_dotenv
 from lightroom_client import LightroomClient, TokenExpiredError, InvalidInputError
 from oauth_handler import OAuthHandler
+from token_store import TokenStore
 
 # Load environment variables
 load_dotenv()
@@ -74,48 +75,77 @@ oauth_handler = OAuthHandler(
 # Initialize Lightroom client
 lightroom_client = LightroomClient(oauth_handler)
 
+# Tokens live here, on the server. The session cookie only carries a random id ("sid")
+# plus the short-lived OAuth state during login.
+token_store = TokenStore()
+
+
+class TransientAuthError(Exception):
+    """Refreshing the token failed for a reason that doesn't mean the login is invalid
+    (timeout, network error, Adobe 5xx...). The session is kept so the user can retry."""
+
 
 # ---------------------------------------------------------------------------
 # Token handling
 # ---------------------------------------------------------------------------
 
-def store_tokens(token_data):
-    """Save a token response in the session, keeping the old refresh token if none is returned."""
-    session['access_token'] = token_data['access_token']
-    session['refresh_token'] = token_data.get('refresh_token') or session.get('refresh_token')
+def is_logged_in():
+    """True if the browser's session id maps to stored tokens."""
+    return token_store.get(session.get('sid')) is not None
 
-    expires_in = float(token_data.get('expires_in', 3600))
-    # Adobe IMS reports expires_in in milliseconds; handle seconds too
-    if expires_in > 10_000_000:
-        expires_in /= 1000.0
-    session['expires_at'] = time.time() + expires_in
+
+@app.context_processor
+def inject_login_state():
+    return {'logged_in': is_logged_in()}
+
+
+def end_session():
+    """Forget the stored tokens and clear the cookie session."""
+    token_store.delete(session.get('sid'))
+    session.clear()
 
 
 def get_valid_access_token():
     """
     Return a usable access token for the current session, refreshing it if it is
     (about to be) expired. Returns None if the user must log in again.
+
+    Refreshes are serialised per session, so parallel requests (e.g. many thumbnails)
+    share one refresh. The session is only destroyed when Adobe definitively rejects
+    the refresh token (HTTP 400/401); transient failures raise TransientAuthError and
+    keep the session.
     """
-    access_token = session.get('access_token')
-    if not access_token:
-        return None
-
-    if time.time() < session.get('expires_at', 0) - TOKEN_REFRESH_MARGIN:
-        return access_token
-
-    refresh_token = session.get('refresh_token')
-    if not refresh_token:
+    sid = session.get('sid')
+    entry = token_store.get(sid)
+    if entry is None:
         session.clear()
         return None
 
-    try:
-        store_tokens(oauth_handler.refresh_access_token(refresh_token))
-    except Exception:
-        logger.warning("Token refresh failed; asking the user to log in again", exc_info=True)
-        session.clear()
-        return None
+    if not entry.needs_refresh(TOKEN_REFRESH_MARGIN):
+        return entry.access_token
 
-    return session['access_token']
+    with entry.lock:
+        # Another request may have refreshed while we waited for the lock
+        if not entry.needs_refresh(TOKEN_REFRESH_MARGIN):
+            return entry.access_token
+
+        if not entry.refresh_token:
+            end_session()
+            return None
+
+        try:
+            entry.update(oauth_handler.refresh_access_token(entry.refresh_token))
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (400, 401):
+                logger.warning("Refresh token rejected by Adobe (HTTP %s); logging the user out", status)
+                end_session()
+                return None
+            raise TransientAuthError(f"Token refresh failed with HTTP {status}") from e
+        except requests.RequestException as e:
+            raise TransientAuthError("Token refresh failed (network error)") from e
+
+        return entry.access_token
 
 
 def _error_response(message, status):
@@ -144,11 +174,18 @@ def require_auth(view):
 
 @app.errorhandler(TokenExpiredError)
 def handle_token_expired(e):
-    # Adobe rejected the token even though we thought it was valid
-    session.clear()
+    # Adobe rejected an access token we believed was valid (e.g. revoked)
+    end_session()
     if request.path.startswith(('/api/', '/thumbnail/')):
         return _error_response("Unauthorized", 401)
     return redirect(url_for('login'))
+
+
+@app.errorhandler(TransientAuthError)
+def handle_transient_auth_error(e):
+    logger.warning("Transient authentication failure: %s (cause: %r)", e, e.__cause__)
+    body, status = _error_response("Adobe is temporarily unavailable. Please try again in a moment.", 503)
+    return body, status, {'Retry-After': '5'}
 
 
 @app.errorhandler(InvalidInputError)
@@ -188,7 +225,7 @@ def simplify_photos(photos):
 @app.route('/')
 def index():
     """Home page - redirects to login if not authenticated"""
-    if 'access_token' not in session:
+    if not is_logged_in():
         return redirect(url_for('login'))
     return redirect(url_for('albums'))
 
@@ -196,7 +233,7 @@ def index():
 @app.route('/login')
 def login():
     """Display login page"""
-    if 'access_token' in session:
+    if is_logged_in():
         return redirect(url_for('albums'))
 
     return render_template('login.html')
@@ -205,7 +242,7 @@ def login():
 @app.route('/oauth/start')
 def oauth_start():
     """Initiate OAuth2 login flow"""
-    if 'access_token' in session:
+    if is_logged_in():
         return redirect(url_for('albums'))
 
     # Per-session CSRF state, validated in /callback
@@ -242,8 +279,9 @@ def callback():
         logger.exception("Token exchange failed")
         return "Authentication failed. Please try signing in again.", 500
 
-    session.clear()  # start from a clean session after login
-    store_tokens(token_data)
+    # Fresh session after login; tokens stay on the server, the cookie only gets a random id
+    end_session()
+    session['sid'] = token_store.create(token_data)
 
     return redirect(url_for('albums'))
 
@@ -370,8 +408,8 @@ def thumbnail(asset_id):
 
 @app.route('/logout')
 def logout():
-    """Logout and clear session"""
-    session.clear()
+    """Logout: discard the stored tokens and clear the session"""
+    end_session()
     return redirect(url_for('login'))
 
 
